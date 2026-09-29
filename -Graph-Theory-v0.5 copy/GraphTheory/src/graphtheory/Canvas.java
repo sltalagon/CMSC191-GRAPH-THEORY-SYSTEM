@@ -35,7 +35,6 @@ public class Canvas {
     private Vector<Vertex> vertexList;
     private Vector<Edge> edgeList;
     private GraphProperties gP = new GraphProperties();
-    private GraphAnalyzer gA = new GraphAnalyzer();
     /////////////
 
     public Canvas(String title, int width, int height, Color bgColour) {
@@ -96,9 +95,6 @@ public class Canvas {
         item.addActionListener(new MenuListener());
         menuOptions3.add(item);
         item = new JMenuItem("Properties");
-        item.addActionListener(new MenuListener());
-        menuOptions3.add(item);
-        item = new JMenuItem("Graph Info");
         item.addActionListener(new MenuListener());
         menuOptions3.add(item);
 
@@ -344,12 +340,6 @@ public class Canvas {
                 //gP.drawNWideDiameter();
                 }
                 erase();
-            } else if (command.equals("Graph Info")) {
-                selectedWindow = 2;
-                if (vertexList.size() > 0) {
-                    gA.analyze(vertexList, edgeList);
-                }
-                erase();
             }
 
             refresh();
@@ -456,41 +446,17 @@ public class Canvas {
                     g.setColor(Color.black);
                     break;
                 }
-                case 1: {   //properties window (matrices + diameters)
+                case 1: {   //properties window
                     canvasImage2.getGraphics().clearRect(0, 0, width, height); //clear
                     gP.drawAdjacencyMatrix(canvasImage2.getGraphics(), vertexList, width / 2 + 50, 50);//draw adjacency matrix
                     gP.drawDistanceMatrix(canvasImage2.getGraphics(), vertexList, width / 2 + 50, height / 2 + 50);//draw distance matrix
                     g.drawImage(canvasImage2, 0, 0, null); //layer 1
-
-                    // Warning text: drawn on g (not on the graph layer) so it stays out of the thumbnail
-                    Font origFont = g.getFont();
-                    g.setColor(Color.black);
-                    g.setFont(origFont.deriveFont(Font.BOLD, 20f));
-                    g.drawString("Graph disconnects when nodes in color red are removed.", 100, height - 30);
-                    g.setFont(origFont);
-
-                    // Diameter / vertex-pair summary
-                    if (vertexList.size() > 0) {
-                        gP.drawSummary(g, 20, height / 2 + 40, height - 50);
-                    }
-
+                    drawString("Graph disconnects when nodes in color red are removed.", 100, height - 30, 20);
+                    g.drawString("See output console for Diameter of Graph", 100, height / 2 + 50);
                     g.drawImage(canvasImage.getScaledInstance(width / 2, height / 2, Image.SCALE_SMOOTH), 0, 0, null); //layer 1
                     g.draw3DRect(0, 0, width / 2, height / 2, true);
                     g.setColor(Color.black);
 
-                    break;
-                }
-                case 2: {   //graph info window (graph-level + node-level properties)
-                    g.setColor(Color.white);
-                    g.fillRect(0, 0, width, height);
-                    g.setColor(Color.black);
-
-                    if (vertexList.size() > 0) {
-                        gA.drawGraphSummary(g, 20, 30, height - 20);
-                        gA.drawNodeSummary(g, width / 2 + 20, 30, height - 20);
-                    } else {
-                        g.drawString("Add vertices first, then open Graph Info again.", 20, 30);
-                    }
                     break;
                 }
             }
@@ -498,3 +464,4 @@ public class Canvas {
         }
     }
 }
+

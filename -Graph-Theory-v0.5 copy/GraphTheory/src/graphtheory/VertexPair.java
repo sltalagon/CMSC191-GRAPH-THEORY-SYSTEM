@@ -102,6 +102,8 @@ public class VertexPair {
         pathList = new Vector<Vector<Vertex>>();
         Vector<Vertex> visitedNodes = new Vector<Vertex>();
 
+        //  System.out.println("Vertex-Disjoint Paths for " + vertex1.name + "-" + vertex2.name);
+
         pathList.removeAllElements();
         visitedNodes.add(vertex1);
         recursePaths(vertex1, visitedNodes);
@@ -114,8 +116,10 @@ public class VertexPair {
             Path.setSize(visitedNodes.size());
             Collections.copy(Path, visitedNodes);
             pathList.add(Path);
-            // (console printing removed - GraphProperties.displayContainers()
-            //  now formats and prints each path itself)
+            for (Vertex a : Path) {
+                System.out.print("-" + a.name);
+            }
+            System.out.println();
         } else {
             for (Vertex x : v.connectedVertices) {
                 if (!visitedNodes.contains(x)) {
@@ -128,6 +132,7 @@ public class VertexPair {
         }
 
     }
+    // public void
 
     public class Paths {
 
