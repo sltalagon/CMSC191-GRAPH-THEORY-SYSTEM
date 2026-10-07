@@ -1,504 +1,967 @@
 /*
- * Computes graph-level and node-level properties and renders them
- * as text summaries for the "Graph Info" window / console.
+ * Computes the graph-level and node-level properties of a graph snapshot and
+ * packages them as ready-to-display rows for the Overview, Vertices, and Degree Distribution tabs.
  */
 package graphtheory;
 
-import java.awt.Color;
-import java.awt.Font;
-import java.awt.Graphics;
-import java.util.ArrayDeque;
-import java.util.Collections;
-import java.util.Deque;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.Map;
-import java.util.Set;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.TreeSet;
 import java.util.Vector;
 
 public class GraphAnalyzer {
 
-    // ---------------- Graph-level properties ----------------
-    public int order;
-    public int size;
-    public boolean connected;
-    public int componentCount;
-    public boolean complete;
-    public boolean bipartite;
-    public boolean tree;
-    public boolean cyclic;
-    public boolean sparse;
-    public boolean dense;
-    public boolean eulerian;
-    public boolean hamiltonianChecked;
-    public boolean hamiltonian;
-    public int vertexConnectivity;   // N(G), -1 if not computed
-    public int edgeConnectivity;     // O(G), -1 if not computed
-    public Vector<Vertex> cutVertices = new Vector<Vertex>();
-    public Vector<Edge> bridges = new Vector<Edge>();
-    public Vector<Vertex> isolatedVertices = new Vector<Vertex>();
+    // ---------------- display rows ----------------
+    public static final int KIND_SECTION = 0, KIND_PROP = 1;
+    public static final int NONE = 0, YES = 1, NO = 2, WARN = 3;
 
-    // ---------------- Node-level properties ----------------
-    public Map<Vertex, Integer> degreeMap = new LinkedHashMap<Vertex, Integer>();
-    public Map<Vertex, Double> centralityMap = new LinkedHashMap<Vertex, Double>();
-    public Map<Vertex, Boolean> cutVertexMap = new LinkedHashMap<Vertex, Boolean>();
+    /** One line of the Overview / Pair tables. */
+    public static class Row {
 
-    // Ready-to-print / ready-to-draw text
-    public Vector<String> graphSummary = new Vector<String>();
-    public Vector<String> nodeSummary = new Vector<String>();
+        public final int kind;
+        public final String name;
+        public String value;
+        public final String tip;
+        public final int state;
+        public final int color;     // section colour (RGB)
 
-    // Brute-force checks are exponential, so cap the vertex count they run on
-    private static final int HAMILTONIAN_LIMIT = 10;
-    private static final int CONNECTIVITY_LIMIT = 12;
+        Row(int kind, String name, String value, String tip, int state, int color) {
+            this.kind = kind;
+            this.name = name;
+            this.value = value;
+            this.tip = tip;
+            this.state = state;
+            this.color = color;
+        }
 
-    public void analyze(Vector<Vertex> vList, Vector<Edge> eList) {
-        order = vList.size();
-        size = eList.size();
+        public static Row section(String title, int color, String tip) {
+            return new Row(KIND_SECTION, title, "", tip, NONE, color);
+        }
 
-        cutVertices.clear();
-        bridges.clear();
-        isolatedVertices.clear();
-        degreeMap.clear();
-        centralityMap.clear();
-        cutVertexMap.clear();
-        graphSummary.clear();
-        nodeSummary.clear();
+        public static Row prop(String name, String value, int state, String tip) {
+            return new Row(KIND_PROP, name, value, tip, state, 0);
+        }
+    }
 
-        if (order == 0) {
+    // Exponential searches only run on small graphs
+    public static final int HAMILTONIAN_LIMIT = 16;
+    public static final int MAX_NON_HAM_LIMIT = 12;
+    public static final int CONNECTIVITY_LIMIT = 40;
+
+    // ---------------- results ----------------
+    public GraphData d;
+    public int order, size;
+    public int components, strongComponents;
+    public int vertexConnectivity = -1, edgeConnectivity = -1;
+    public boolean connected, stronglyConnected;
+    public boolean simple, multigraph, complete, empty, cycleGraph;
+    public boolean bipartite, completeBipartite, star, tree, forest, cyclic;
+    public boolean nonseparable;
+    public boolean eulerian, semiEulerian;
+    public boolean hamiltonianChecked, hamiltonian, traceable;
+    public boolean maxNonHamChecked, maximalNonHamiltonian;
+    public boolean selfComplementary;
+    public Vector<Integer> cutVertices = new Vector<Integer>();
+    public Vector<Integer> bridges = new Vector<Integer>();         // edge indices
+    public Vector<Integer> isolated = new Vector<Integer>();
+    public Vector<int[]> blocks = new Vector<int[]>();               // vertex indices per block
+    public double density;
+
+    // Degree distribution statistics
+    public int[] degreeCounts = new int[0];
+    public int[] inDegreeCounts = new int[0];
+    public int[] outDegreeCounts = new int[0];
+    public int minDegree, maxDegree;
+    public double avgDegree;
+    public int minInDegree, maxInDegree, minOutDegree, maxOutDegree;
+    public double avgInDegree, avgOutDegree;
+
+    public Vector<Row> overview = new Vector<Row>();
+    public String[] nodeColumns = new String[0];
+    public Class<?>[] nodeClasses = new Class<?>[0];
+    public Object[][] nodeRows = new Object[0][0];
+
+    // internals
+    private int n;
+    private int[] compOf;
+    private Vector<Vector<Integer>> compList = new Vector<Vector<Integer>>();
+    private int[] color2;                       // bipartition (0/1), -1 if not bipartite
+    private int centre = -1;                    // centre of a star
+    private String complementNote = "";
+    private double[] degreeCentrality, closeness, betweenness;
+
+    private static final double EPS = 1e-9;
+
+    // ==================================================================
+    /** Number of vertices in the graph last analysed (0 if none). */
+    public int getN() {
+        return d == null ? 0 : d.n;
+    }
+
+    public void analyze(GraphData data) {
+        d = data;
+        n = d.n;
+        order = n;
+        size = d.m;
+        overview = new Vector<Row>();
+        cutVertices = new Vector<Integer>();
+        bridges = new Vector<Integer>();
+        isolated = new Vector<Integer>();
+        blocks = new Vector<int[]>();
+        vertexConnectivity = -1;
+        edgeConnectivity = -1;
+        if (n == 0) {
+            nodeRows = new Object[0][0];
+            degreeCounts = new int[0];
+            inDegreeCounts = new int[0];
+            outDegreeCounts = new int[0];
+            minDegree = maxDegree = 0;
+            avgDegree = 0;
             return;
         }
-
-        for (Vertex v : vList) {
-            int d = v.getDegree();
-            degreeMap.put(v, d);
-            centralityMap.put(v, order > 1 ? round2((double) d / (order - 1)) : 0.0);
-            if (d == 0) {
-                isolatedVertices.add(v);
+        for (int v = 0; v < n; v++) {
+            if (d.degree[v] == 0) {
+                isolated.add(v);
             }
         }
 
-        connected = isConnected(vList);
-        componentCount = countComponents(vList);
-        complete = isComplete(vList);
-        bipartite = isBipartite(vList);
-        cyclic = hasCycle(vList);
-        tree = connected && !cyclic;
+        findComponents();
+        findStrongComponents();
+        findBlocks();
+        simple = d.isSimple();
+        multigraph = hasParallel();
+        density = computeDensity();
+        classifyFamilies();
+        computeConnectivityNumbers();
+        classifyTraversal();
+        complementInfo();
+        computeCentralities();
+        computeDegreeDistribution();
+        buildNodeTable();
+        buildOverview();
+    }
 
-        double density = order > 1 ? (2.0 * size) / ((double) order * (order - 1)) : 0;
-        sparse = density <= 0.3;
-        dense = density >= 0.7;
+    // ==================================================================
+    // Degree Distribution
+    // ==================================================================
+    private void computeDegreeDistribution() {
+        if (n == 0) return;
 
-        eulerian = connected && allDegreesEven(vList);
-
-        cutVertices = findCutVertices(vList);
-        for (Vertex v : vList) {
-            cutVertexMap.put(v, cutVertices.contains(v));
+        int maxD = 0, maxIn = 0, maxOut = 0;
+        for (int v = 0; v < n; v++) {
+            if (d.degree[v] > maxD) maxD = d.degree[v];
+            if (d.indeg[v] > maxIn) maxIn = d.indeg[v];
+            if (d.outdeg[v] > maxOut) maxOut = d.outdeg[v];
         }
 
-        bridges = findBridges(vList, eList);
+        maxDegree = maxD;
+        minDegree = Integer.MAX_VALUE;
+        double sumDeg = 0;
+        degreeCounts = new int[maxD + 1];
 
-        vertexConnectivity = (connected && order <= CONNECTIVITY_LIMIT) ? computeVertexConnectivity(vList) : -1;
-        edgeConnectivity = (connected && order <= CONNECTIVITY_LIMIT) ? computeEdgeConnectivity(vList, eList) : -1;
+        for (int v = 0; v < n; v++) {
+            int deg = d.degree[v];
+            degreeCounts[deg]++;
+            sumDeg += deg;
+            if (deg < minDegree) minDegree = deg;
+        }
+        avgDegree = (double) sumDeg / n;
 
-        hamiltonianChecked = order >= 3 && order <= HAMILTONIAN_LIMIT;
-        hamiltonian = hamiltonianChecked && hasHamiltonianCycle(vList);
+        if (d.directed) {
+            inDegreeCounts = new int[maxIn + 1];
+            outDegreeCounts = new int[maxOut + 1];
+            minInDegree = Integer.MAX_VALUE;
+            maxInDegree = maxIn;
+            minOutDegree = Integer.MAX_VALUE;
+            maxOutDegree = maxOut;
+            double sumIn = 0, sumOut = 0;
 
-        buildSummaries(vList);
-        printReport();
-    }
-
-    private double round2(double d) {
-        return Math.round(d * 100.0) / 100.0;
-    }
-
-    // ---------------- Connectivity / structure checks ----------------
-
-    private boolean isConnected(Vector<Vertex> vList) {
-        return countComponents(vList) <= 1;
-    }
-
-    private int countComponents(Vector<Vertex> vList) {
-        Set<Vertex> visited = new HashSet<Vertex>();
-        int count = 0;
-        for (Vertex start : vList) {
-            if (!visited.contains(start)) {
-                count++;
-                Deque<Vertex> stack = new ArrayDeque<Vertex>();
-                stack.push(start);
-                visited.add(start);
-                while (!stack.isEmpty()) {
-                    Vertex v = stack.pop();
-                    for (Vertex n : v.connectedVertices) {
-                        if (!visited.contains(n)) {
-                            visited.add(n);
-                            stack.push(n);
-                        }
-                    }
-                }
+            for (int v = 0; v < n; v++) {
+                int inD = d.indeg[v];
+                int outD = d.outdeg[v];
+                inDegreeCounts[inD]++;
+                outDegreeCounts[outD]++;
+                sumIn += inD;
+                sumOut += outD;
+                if (inD < minInDegree) minInDegree = inD;
+                if (outD < minOutDegree) minOutDegree = outD;
             }
+            avgInDegree = sumIn / n;
+            avgOutDegree = sumOut / n;
         }
-        return count;
     }
 
-    private boolean isComplete(Vector<Vertex> vList) {
-        int n = vList.size();
-        if (n <= 1) {
-            return true;
-        }
-        for (Vertex v : vList) {
-            if (v.getDegree() != n - 1) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private boolean isBipartite(Vector<Vertex> vList) {
-        Map<Vertex, Integer> color = new HashMap<Vertex, Integer>();
-        for (Vertex start : vList) {
-            if (color.containsKey(start)) {
+    // ==================================================================
+    // Components
+    // ==================================================================
+    private void findComponents() {
+        compOf = new int[n];
+        Arrays.fill(compOf, -1);
+        compList = new Vector<Vector<Integer>>();
+        for (int s = 0; s < n; s++) {
+            if (compOf[s] != -1) {
                 continue;
             }
-            color.put(start, 0);
-            Deque<Vertex> queue = new ArrayDeque<Vertex>();
-            queue.add(start);
-            while (!queue.isEmpty()) {
-                Vertex v = queue.poll();
-                for (Vertex n : v.connectedVertices) {
-                    if (!color.containsKey(n)) {
-                        color.put(n, 1 - color.get(v));
-                        queue.add(n);
-                    } else if (color.get(n).equals(color.get(v))) {
-                        return false;
+            Vector<Integer> comp = new Vector<Integer>();
+            int id = compList.size();
+            int[] stack = new int[n];
+            int sp = 0;
+            stack[sp++] = s;
+            compOf[s] = id;
+            while (sp > 0) {
+                int u = stack[--sp];
+                comp.add(u);
+                for (int v : d.nbr[u]) {
+                    if (compOf[v] == -1) {
+                        compOf[v] = id;
+                        stack[sp++] = v;
+                    }
+                }
+            }
+            java.util.Collections.sort(comp);
+            compList.add(comp);
+        }
+        components = compList.size();
+        connected = components == 1;
+    }
+
+    private boolean[] seen;
+    private int[] finishOrder;
+    private int finishCount;
+
+    private void findStrongComponents() {
+        if (!d.directed) {
+            strongComponents = components;
+            stronglyConnected = connected;
+            return;
+        }
+        seen = new boolean[n];
+        finishOrder = new int[n];
+        finishCount = 0;
+        for (int s = 0; s < n; s++) {
+            if (!seen[s]) {
+                dfsFinish(s);
+            }
+        }
+        boolean[] assigned = new boolean[n];
+        int count = 0;
+        for (int i = n - 1; i >= 0; i--) {
+            int s = finishOrder[i];
+            if (assigned[s]) {
+                continue;
+            }
+            count++;
+            int[] stack = new int[n];
+            int sp = 0;
+            stack[sp++] = s;
+            assigned[s] = true;
+            while (sp > 0) {
+                int u = stack[--sp];
+                for (int w = 0; w < n; w++) {       // reverse arcs: w -> u
+                    if (!assigned[w] && d.arc[w][u]) {
+                        assigned[w] = true;
+                        stack[sp++] = w;
                     }
                 }
             }
         }
-        return true;
+        strongComponents = count;
+        stronglyConnected = count == 1;
     }
 
-    private boolean hasCycle(Vector<Vertex> vList) {
-        Set<Vertex> visited = new HashSet<Vertex>();
-        for (Vertex start : vList) {
-            if (!visited.contains(start)) {
-                if (cycleDFS(start, null, visited)) {
-                    return true;
-                }
+    private void dfsFinish(int u) {
+        seen[u] = true;
+        for (int v : d.out[u]) {
+            if (!seen[v]) {
+                dfsFinish(v);
             }
         }
-        return false;
+        finishOrder[finishCount++] = u;
     }
 
-    private boolean cycleDFS(Vertex v, Vertex parent, Set<Vertex> visited) {
-        visited.add(v);
-        for (Vertex n : v.connectedVertices) {
-            if (!visited.contains(n)) {
-                if (cycleDFS(n, v, visited)) {
-                    return true;
-                }
-            } else if (n != parent) {
-                return true;
+    // ==================================================================
+    // Cutpoints, bridges and blocks
+    // ==================================================================
+    private int[] disc, low;
+    private int timer;
+    private boolean[] isCut;
+    private boolean[] isBridge;
+    private Vector<Integer> edgeStack;
+    private Vector<Vector<int[]>> adjE;
+
+    private void findBlocks() {
+        adjE = new Vector<Vector<int[]>>();
+        for (int i = 0; i < n; i++) {
+            adjE.add(new Vector<int[]>());
+        }
+        for (int e = 0; e < d.m; e++) {
+            if (d.eu[e] != d.ev[e]) {
+                adjE.get(d.eu[e]).add(new int[]{d.ev[e], e});
+                adjE.get(d.ev[e]).add(new int[]{d.eu[e], e});
             }
         }
-        return false;
+        disc = new int[n];
+        low = new int[n];
+        Arrays.fill(disc, -1);
+        timer = 0;
+        isCut = new boolean[n];
+        isBridge = new boolean[d.m];
+        edgeStack = new Vector<Integer>();
+        for (int s = 0; s < n; s++) {
+            if (disc[s] == -1) {
+                bcc(s, -1);
+            }
+        }
+        for (int v = 0; v < n; v++) {
+            if (isCut[v]) {
+                cutVertices.add(v);
+            }
+        }
+        for (int e = 0; e < d.m; e++) {
+            if (isBridge[e]) {
+                bridges.add(e);
+            }
+        }
+        nonseparable = connected && n >= 2 && cutVertices.isEmpty();
     }
 
-    private boolean allDegreesEven(Vector<Vertex> vList) {
-        for (Vertex v : vList) {
-            if (v.getDegree() % 2 != 0) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    // Articulation points via DFS low-link
-    private Vector<Vertex> findCutVertices(Vector<Vertex> vList) {
-        Vector<Vertex> result = new Vector<Vertex>();
-        if (vList.isEmpty()) {
-            return result;
-        }
-
-        Map<Vertex, Integer> disc = new HashMap<Vertex, Integer>();
-        Map<Vertex, Integer> low = new HashMap<Vertex, Integer>();
-        Map<Vertex, Vertex> parent = new HashMap<Vertex, Vertex>();
-        Set<Vertex> visited = new HashSet<Vertex>();
-        Set<Vertex> articulation = new HashSet<Vertex>();
-        int[] timer = {0};
-
-        for (Vertex start : vList) {
-            if (!visited.contains(start)) {
-                apDFS(start, visited, disc, low, parent, articulation, timer);
-            }
-        }
-        for (Vertex v : vList) {
-            if (articulation.contains(v)) {
-                result.add(v);
-            }
-        }
-        return result;
-    }
-
-    private void apDFS(Vertex u, Set<Vertex> visited, Map<Vertex, Integer> disc, Map<Vertex, Integer> low,
-            Map<Vertex, Vertex> parent, Set<Vertex> articulation, int[] timer) {
-        visited.add(u);
-        disc.put(u, timer[0]);
-        low.put(u, timer[0]);
-        timer[0]++;
+    private void bcc(int u, int parentEdge) {
+        disc[u] = low[u] = timer++;
         int children = 0;
-
-        for (Vertex v : u.connectedVertices) {
-            if (!visited.contains(v)) {
+        for (int[] ve : adjE.get(u)) {
+            int v = ve[0], e = ve[1];
+            if (e == parentEdge) {
+                continue;
+            }
+            if (disc[v] == -1) {
                 children++;
-                parent.put(v, u);
-                apDFS(v, visited, disc, low, parent, articulation, timer);
-                low.put(u, Math.min(low.get(u), low.get(v)));
-
-                if (parent.get(u) == null && children > 1) {
-                    articulation.add(u);
+                edgeStack.add(e);
+                bcc(v, e);
+                low[u] = Math.min(low[u], low[v]);
+                if (low[v] >= disc[u]) {
+                    if (parentEdge != -1 || children > 1) {
+                        isCut[u] = true;
+                    }
+                    TreeSet<Integer> verts = new TreeSet<Integer>();
+                    while (!edgeStack.isEmpty()) {
+                        int x = edgeStack.remove(edgeStack.size() - 1);
+                        verts.add(d.eu[x]);
+                        verts.add(d.ev[x]);
+                        if (x == e) {
+                            break;
+                        }
+                    }
+                    int[] b = new int[verts.size()];
+                    int k = 0;
+                    for (int x : verts) {
+                        b[k++] = x;
+                    }
+                    blocks.add(b);
                 }
-                if (parent.get(u) != null && low.get(v) >= disc.get(u)) {
-                    articulation.add(u);
+                if (low[v] > disc[u]) {
+                    isBridge[e] = true;
                 }
-            } else if (v != parent.get(u)) {
-                low.put(u, Math.min(low.get(u), disc.get(v)));
+            } else if (disc[v] < disc[u]) {
+                edgeStack.add(e);
+                low[u] = Math.min(low[u], disc[v]);
             }
         }
     }
 
-    // Bridges via DFS low-link
-    private Vector<Edge> findBridges(Vector<Vertex> vList, Vector<Edge> eList) {
-        Vector<Edge> result = new Vector<Edge>();
-        if (vList.isEmpty()) {
-            return result;
-        }
-
-        Map<Vertex, Integer> disc = new HashMap<Vertex, Integer>();
-        Map<Vertex, Integer> low = new HashMap<Vertex, Integer>();
-        Map<Vertex, Vertex> parent = new HashMap<Vertex, Vertex>();
-        Set<Vertex> visited = new HashSet<Vertex>();
-        Set<String> bridgeKeys = new HashSet<String>();
-        int[] timer = {0};
-
-        for (Vertex start : vList) {
-            if (!visited.contains(start)) {
-                bridgeDFS(start, visited, disc, low, parent, bridgeKeys, timer);
-            }
-        }
-
-        for (Edge e : eList) {
-            String k1 = e.vertex1.name + "|" + e.vertex2.name;
-            String k2 = e.vertex2.name + "|" + e.vertex1.name;
-            if (bridgeKeys.contains(k1) || bridgeKeys.contains(k2)) {
-                result.add(e);
-            }
-        }
-        return result;
-    }
-
-    private void bridgeDFS(Vertex u, Set<Vertex> visited, Map<Vertex, Integer> disc, Map<Vertex, Integer> low,
-            Map<Vertex, Vertex> parent, Set<String> bridgeKeys, int[] timer) {
-        visited.add(u);
-        disc.put(u, timer[0]);
-        low.put(u, timer[0]);
-        timer[0]++;
-
-        for (Vertex v : u.connectedVertices) {
-            if (!visited.contains(v)) {
-                parent.put(v, u);
-                bridgeDFS(v, visited, disc, low, parent, bridgeKeys, timer);
-                low.put(u, Math.min(low.get(u), low.get(v)));
-                if (low.get(v) > disc.get(u)) {
-                    bridgeKeys.add(u.name + "|" + v.name);
+    // ==================================================================
+    // Simple facts
+    // ==================================================================
+    private boolean hasParallel() {
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                if (i != j && d.mult[i][j] > 1) {
+                    return true;
                 }
-            } else if (v != parent.get(u)) {
-                low.put(u, Math.min(low.get(u), disc.get(v)));
             }
         }
+        return false;
     }
 
-    // Brute-force minimum vertex cut size (small graphs only)
-    private int computeVertexConnectivity(Vector<Vertex> vList) {
-        int n = vList.size();
-        if (n <= 1) {
+    private int parallelPairs() {
+        int c = 0;
+        for (int i = 0; i < n; i++) {
+            for (int j = d.directed ? 0 : i + 1; j < n; j++) {
+                if (i != j && d.mult[i][j] > 1) {
+                    c++;
+                }
+            }
+        }
+        return c;
+    }
+
+    private double computeDensity() {
+        if (n < 2) {
             return 0;
         }
-        if (isComplete(vList)) {
-            return n - 1;
-        }
-        for (int k = 1; k < n; k++) {
-            if (existsDisconnectingVertexSubset(vList, k)) {
-                return k;
-            }
-        }
-        return n - 1;
+        double max = d.directed ? (double) n * (n - 1) : n * (n - 1) / 2.0;
+        return d.distinctArcs() / max;
     }
 
-    private boolean existsDisconnectingVertexSubset(Vector<Vertex> vList, int k) {
-        int[] combo = new int[k];
-        return tryVertexCombo(vList, combo, 0, 0, vList.size(), k);
+    // ==================================================================
+    // Graph families
+    // ==================================================================
+    private void classifyFamilies() {
+        complete = true;
+        for (int i = 0; i < n && complete; i++) {
+            for (int j = 0; j < n; j++) {
+                if (i != j && !d.arc[i][j]) {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        empty = d.m == 0;
+
+        boolean uSimple = d.isUnderlyingSimple();
+
+        cycleGraph = false;
+        if (d.directed) {
+            if (n >= 2 && simple && stronglyConnected) {
+                cycleGraph = true;
+                for (int v = 0; v < n; v++) {
+                    if (d.indeg[v] != 1 || d.outdeg[v] != 1) {
+                        cycleGraph = false;
+                    }
+                }
+            }
+        } else if (n >= 3 && uSimple && connected) {
+            cycleGraph = true;
+            for (int v = 0; v < n; v++) {
+                if (d.degree[v] != 2) {
+                    cycleGraph = false;
+                }
+            }
+        }
+
+        color2 = new int[n];
+        Arrays.fill(color2, -1);
+        bipartite = d.totalLoops == 0;
+        for (int s = 0; s < n && bipartite; s++) {
+            if (color2[s] != -1) {
+                continue;
+            }
+            color2[s] = 0;
+            int[] queue = new int[n];
+            int head = 0, tail = 0;
+            queue[tail++] = s;
+            while (head < tail && bipartite) {
+                int u = queue[head++];
+                for (int v : d.nbr[u]) {
+                    if (color2[v] == -1) {
+                        color2[v] = 1 - color2[u];
+                        queue[tail++] = v;
+                    } else if (color2[v] == color2[u]) {
+                        bipartite = false;
+                        break;
+                    }
+                }
+            }
+        }
+        completeBipartite = false;
+        if (bipartite && connected && n >= 2 && uSimple) {
+            int p = 0, q = 0;
+            for (int v = 0; v < n; v++) {
+                if (color2[v] == 0) {
+                    p++;
+                } else {
+                    q++;
+                }
+            }
+            completeBipartite = q > 0 && d.m == p * q;
+        }
+
+        forest = d.totalLoops == 0 && d.m == n - components;
+        tree = forest && connected;
+
+        star = false;
+        centre = -1;
+        if (n >= 2 && uSimple && tree) {
+            for (int v = 0; v < n; v++) {
+                if (d.nbr[v].length == n - 1) {
+                    star = true;
+                    centre = v;
+                    break;
+                }
+            }
+        }
+
+        if (d.directed) {
+            cyclic = hasDirectedCycle();
+        } else {
+            cyclic = !forest;
+        }
     }
 
-    private boolean tryVertexCombo(Vector<Vertex> vList, int[] combo, int start, int idx, int n, int k) {
-        if (idx == k) {
-            Set<Vertex> removed = new HashSet<Vertex>();
-            for (int i : combo) {
-                removed.add(vList.get(i));
-            }
-            return disconnectsGraph(vList, removed, null);
-        }
-        for (int i = start; i < n; i++) {
-            combo[idx] = i;
-            if (tryVertexCombo(vList, combo, i + 1, idx + 1, n, k)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean disconnectsGraph(Vector<Vertex> vList, Set<Vertex> removedVertices, Set<String> removedEdgeKeys) {
-        Vector<Vertex> remaining = new Vector<Vertex>();
-        for (Vertex v : vList) {
-            if (!removedVertices.contains(v)) {
-                remaining.add(v);
-            }
-        }
-        if (remaining.isEmpty()) {
+    private boolean hasDirectedCycle() {
+        if (d.totalLoops > 0) {
             return true;
         }
+        int[] indeg = new int[n];
+        for (int u = 0; u < n; u++) {
+            for (int v : d.out[u]) {
+                indeg[v]++;
+            }
+        }
+        int[] queue = new int[n];
+        int head = 0, tail = 0;
+        for (int v = 0; v < n; v++) {
+            if (indeg[v] == 0) {
+                queue[tail++] = v;
+            }
+        }
+        while (head < tail) {
+            int u = queue[head++];
+            for (int v : d.out[u]) {
+                if (--indeg[v] == 0) {
+                    queue[tail++] = v;
+                }
+            }
+        }
+        return tail < n;
+    }
 
-        Set<Vertex> visited = new HashSet<Vertex>();
-        Deque<Vertex> stack = new ArrayDeque<Vertex>();
-        Vertex startV = remaining.firstElement();
-        stack.push(startV);
-        visited.add(startV);
-        while (!stack.isEmpty()) {
-            Vertex v = stack.pop();
-            for (Vertex n : v.connectedVertices) {
-                if (removedVertices.contains(n)) {
+    // ==================================================================
+    // Connectivity numbers
+    // ==================================================================
+    private void computeConnectivityNumbers() {
+        if (n > CONNECTIVITY_LIMIT) {
+            return;
+        }
+        boolean linked = d.directed ? stronglyConnected : connected;
+        if (n == 1 || !linked) {
+            vertexConnectivity = 0;
+            edgeConnectivity = 0;
+            return;
+        }
+        int[][] cap = new int[n][n];
+        for (int u = 0; u < n; u++) {
+            for (int v = 0; v < n; v++) {
+                if (u != v) {
+                    cap[u][v] = d.mult[u][v];
+                }
+            }
+        }
+        int best = Integer.MAX_VALUE;
+        for (int t = 1; t < n; t++) {
+            best = Math.min(best, maxFlow(cap, 0, t));
+            if (d.directed) {
+                best = Math.min(best, maxFlow(cap, t, 0));
+            }
+        }
+        edgeConnectivity = best;
+
+        if (complete) {
+            vertexConnectivity = n - 1;
+            return;
+        }
+        int kappa = n - 1;
+        for (int s = 0; s < n; s++) {
+            for (int t = 0; t < n; t++) {
+                if (s == t || d.arc[s][t] || (!d.directed && t < s)) {
                     continue;
                 }
-                if (removedEdgeKeys != null) {
-                    String k1 = v.name + "|" + n.name;
-                    String k2 = n.name + "|" + v.name;
-                    if (removedEdgeKeys.contains(k1) || removedEdgeKeys.contains(k2)) {
-                        continue;
+                kappa = Math.min(kappa, localVertexConnectivity(s, t));
+            }
+        }
+        vertexConnectivity = kappa;
+    }
+
+    private int localVertexConnectivity(int s, int t) {
+        int big = n + 1;
+        int N = 2 * n;
+        int[][] cap = new int[N][N];
+        for (int v = 0; v < n; v++) {
+            cap[2 * v][2 * v + 1] = (v == s || v == t) ? big : 1;
+        }
+        for (int u = 0; u < n; u++) {
+            for (int v : d.out[u]) {
+                cap[2 * u + 1][2 * v] = big;
+            }
+        }
+        return maxFlow(cap, 2 * s + 1, 2 * t);
+    }
+
+    private static int maxFlow(int[][] capIn, int s, int t) {
+        int N = capIn.length;
+        int[][] cap = new int[N][];
+        for (int i = 0; i < N; i++) {
+            cap[i] = capIn[i].clone();
+        }
+        int flow = 0;
+        int[] parent = new int[N];
+        int[] queue = new int[N];
+        while (true) {
+            Arrays.fill(parent, -1);
+            parent[s] = s;
+            int head = 0, tail = 0;
+            queue[tail++] = s;
+            while (head < tail && parent[t] == -1) {
+                int u = queue[head++];
+                for (int v = 0; v < N; v++) {
+                    if (parent[v] == -1 && cap[u][v] > 0) {
+                        parent[v] = u;
+                        queue[tail++] = v;
                     }
                 }
-                if (!visited.contains(n)) {
-                    visited.add(n);
-                    stack.push(n);
+            }
+            if (parent[t] == -1) {
+                return flow;
+            }
+            int push = Integer.MAX_VALUE;
+            for (int v = t; v != s; v = parent[v]) {
+                push = Math.min(push, cap[parent[v]][v]);
+            }
+            for (int v = t; v != s; v = parent[v]) {
+                cap[parent[v]][v] -= push;
+                cap[v][parent[v]] += push;
+            }
+            flow += push;
+        }
+    }
+
+    // ==================================================================
+    // Eulerian / Hamiltonian
+    // ==================================================================
+    private String eulerNote = "";
+
+    private void classifyTraversal() {
+        eulerian = false;
+        semiEulerian = false;
+        int withEdges = 0;
+        boolean[] compHasEdge = new boolean[components];
+        for (int v = 0; v < n; v++) {
+            if (d.degree[v] > 0) {
+                compHasEdge[compOf[v]] = true;
+            }
+        }
+        for (boolean b : compHasEdge) {
+            if (b) {
+                withEdges++;
+            }
+        }
+        if (d.m == 0) {
+            eulerNote = "no edges";
+        } else if (withEdges > 1) {
+            eulerNote = "edges lie in " + withEdges + " separate components";
+        } else if (!d.directed) {
+            int odd = 0;
+            for (int v = 0; v < n; v++) {
+                if (d.degree[v] % 2 != 0) {
+                    odd++;
+                }
+            }
+            if (odd == 0) {
+                eulerian = true;
+                eulerNote = "every vertex has even degree";
+            } else if (odd == 2) {
+                semiEulerian = true;
+                eulerNote = "exactly 2 odd-degree vertices: an Euler trail exists, but not a circuit";
+            } else {
+                eulerNote = odd + " vertices have odd degree";
+            }
+        } else {
+            int plus = 0, minus = 0, bad = 0;
+            for (int v = 0; v < n; v++) {
+                int diff = d.outdeg[v] - d.indeg[v];
+                if (diff == 0) {
+                    continue;
+                }
+                if (diff == 1) {
+                    plus++;
+                } else if (diff == -1) {
+                    minus++;
+                } else {
+                    bad++;
+                }
+            }
+            if (bad == 0 && plus == 0 && minus == 0) {
+                eulerian = true;
+                eulerNote = "in-degree = out-degree at every vertex";
+            } else if (bad == 0 && plus == 1 && minus == 1) {
+                semiEulerian = true;
+                eulerNote = "an Euler trail exists, but not a circuit";
+            } else {
+                eulerNote = "in-degree and out-degree are unbalanced";
+            }
+        }
+
+        hamiltonianChecked = n <= HAMILTONIAN_LIMIT && n >= (d.directed ? 2 : 3);
+        hamiltonian = hamiltonianChecked && hamCycle(d.arc, n, d.directed);
+        traceable = n <= HAMILTONIAN_LIMIT && hamPath(d.arc, n);
+
+        maxNonHamChecked = hamiltonianChecked && n <= MAX_NON_HAM_LIMIT;
+        maximalNonHamiltonian = false;
+        if (maxNonHamChecked && !hamiltonian) {
+            boolean all = true;
+            boolean[][] a = new boolean[n][];
+            for (int i = 0; i < n; i++) {
+                a[i] = d.arc[i].clone();
+            }
+            for (int i = 0; i < n && all; i++) {
+                for (int j = d.directed ? 0 : i + 1; j < n && all; j++) {
+                    if (i == j || a[i][j]) {
+                        continue;
+                    }
+                    a[i][j] = true;
+                    if (!d.directed) {
+                        a[j][i] = true;
+                    }
+                    if (!hamCycle(a, n, d.directed)) {
+                        all = false;
+                    }
+                    a[i][j] = false;
+                    if (!d.directed) {
+                        a[j][i] = false;
+                    }
+                }
+            }
+            maximalNonHamiltonian = all;
+        }
+    }
+
+    static boolean hamCycle(boolean[][] a, int n, boolean directed) {
+        if (n < (directed ? 2 : 3)) {
+            return false;
+        }
+        int full = (1 << n) - 1;
+        int[] dp = new int[1 << n];
+        dp[1] = 1;
+        for (int mask = 1; mask <= full; mask += 2) {
+            int ends = dp[mask];
+            if (ends == 0) {
+                continue;
+            }
+            for (int v = 0; v < n; v++) {
+                if ((ends & (1 << v)) == 0) {
+                    continue;
+                }
+                for (int w = 1; w < n; w++) {
+                    if ((mask & (1 << w)) == 0 && a[v][w]) {
+                        dp[mask | (1 << w)] |= (1 << w);
+                    }
                 }
             }
         }
-        return visited.size() != remaining.size();
-    }
-
-    // Brute-force minimum edge cut size (small graphs only)
-    private int computeEdgeConnectivity(Vector<Vertex> vList, Vector<Edge> eList) {
-        int m = eList.size();
-        if (m == 0) {
-            return 0;
-        }
-        int minDegree = Integer.MAX_VALUE;
-        for (Vertex v : vList) {
-            minDegree = Math.min(minDegree, v.getDegree());
-        }
-        for (int k = 1; k <= minDegree; k++) {
-            if (existsDisconnectingEdgeSubset(vList, eList, k)) {
-                return k;
-            }
-        }
-        return minDegree;
-    }
-
-    private boolean existsDisconnectingEdgeSubset(Vector<Vertex> vList, Vector<Edge> eList, int k) {
-        int[] combo = new int[k];
-        return tryEdgeCombo(vList, eList, combo, 0, 0, eList.size(), k);
-    }
-
-    private boolean tryEdgeCombo(Vector<Vertex> vList, Vector<Edge> eList, int[] combo, int start, int idx, int m, int k) {
-        if (idx == k) {
-            Set<String> removed = new HashSet<String>();
-            for (int i : combo) {
-                Edge e = eList.get(i);
-                removed.add(e.vertex1.name + "|" + e.vertex2.name);
-            }
-            return disconnectsGraph(vList, Collections.<Vertex>emptySet(), removed);
-        }
-        for (int i = start; i < m; i++) {
-            combo[idx] = i;
-            if (tryEdgeCombo(vList, eList, combo, i + 1, idx + 1, m, k)) {
+        for (int v = 1; v < n; v++) {
+            if ((dp[full] & (1 << v)) != 0 && a[v][0]) {
                 return true;
             }
         }
         return false;
     }
 
-    // Hamiltonian cycle: backtracking search
-    private boolean hasHamiltonianCycle(Vector<Vertex> vList) {
-        int n = vList.size();
-        if (n < 3) {
-            return false;
+    static boolean hamPath(boolean[][] a, int n) {
+        if (n <= 1) {
+            return n == 1;
         }
-        boolean[] visited = new boolean[n];
-        int[] path = new int[n];
-        path[0] = 0;
-        visited[0] = true;
-        return hamDFS(vList, path, visited, 1, n);
-    }
-
-    private boolean hamDFS(Vector<Vertex> vList, int[] path, boolean[] visited, int pos, int n) {
-        if (pos == n) {
-            return vList.get(path[pos - 1]).connectedToVertex(vList.get(path[0]));
+        int full = (1 << n) - 1;
+        int[] dp = new int[1 << n];
+        for (int v = 0; v < n; v++) {
+            dp[1 << v] = 1 << v;
         }
-        Vertex prev = vList.get(path[pos - 1]);
-        for (int i = 0; i < n; i++) {
-            if (!visited[i] && prev.connectedToVertex(vList.get(i))) {
-                visited[i] = true;
-                path[pos] = i;
-                if (hamDFS(vList, path, visited, pos + 1, n)) {
-                    return true;
+        for (int mask = 1; mask <= full; mask++) {
+            int ends = dp[mask];
+            if (ends == 0) {
+                continue;
+            }
+            for (int v = 0; v < n; v++) {
+                if ((ends & (1 << v)) == 0) {
+                    continue;
                 }
-                visited[i] = false;
+                for (int w = 0; w < n; w++) {
+                    if ((mask & (1 << w)) == 0 && a[v][w]) {
+                        dp[mask | (1 << w)] |= (1 << w);
+                    }
+                }
             }
         }
-        return false;
+        return dp[full] != 0;
     }
 
-    // ---------------- Summaries ----------------
+    // ==================================================================
+    // Complement
+    // ==================================================================
+    private int complementEdges;
 
-    private void buildSummaries(Vector<Vertex> vList) {
-        graphSummary.add("Order |V| = " + order + "   Size |E| = " + size);
-        graphSummary.add("Connected: " + yn(connected) + "   Components: " + componentCount);
-        graphSummary.add("Complete: " + yn(complete) + "   Bipartite: " + yn(bipartite));
-        graphSummary.add("Tree: " + yn(tree) + "   Cyclic: " + yn(cyclic));
-        graphSummary.add("Sparse: " + yn(sparse) + "   Dense: " + yn(dense));
-        graphSummary.add("Eulerian: " + yn(eulerian));
-        graphSummary.add("Hamiltonian: "
-                + (hamiltonianChecked ? yn(hamiltonian) : "not checked (>" + HAMILTONIAN_LIMIT + " vertices)"));
-        graphSummary.add("Vertex connectivity N(G): "
-                + (vertexConnectivity == -1 ? "not computed" : String.valueOf(vertexConnectivity)));
-        graphSummary.add("Edge connectivity O(G): "
-                + (edgeConnectivity == -1 ? "not computed" : String.valueOf(edgeConnectivity)));
-        graphSummary.add("Cut vertices: " + namesOf(cutVertices));
-        graphSummary.add("Bridges: " + edgeNamesOf(bridges));
-        graphSummary.add("Isolated vertices: " + namesOf(isolatedVertices));
-
-        nodeSummary.add(String.format("%-6s %-5s %-10s %-6s", "Vertex", "Deg", "Central.", "Cut?"));
-        for (Vertex v : vList) {
-            nodeSummary.add(String.format("%-6s %-5d %-10s %-6s",
-                    v.name, degreeMap.get(v), String.valueOf(centralityMap.get(v)),
-                    cutVertexMap.get(v) ? "yes" : "no"));
+    private void complementInfo() {
+        complementEdges = (d.directed ? n * (n - 1) : n * (n - 1) / 2) - d.distinctArcs();
+        selfComplementary = false;
+        if (!d.isSimple()) {
+            complementNote = "no (the graph is not simple)";
+            return;
+        }
+        if (complementEdges != d.m) {
+            complementNote = "no (a graph and its complement need the same number of edges)";
+            return;
+        }
+        GraphCompare.Match r = GraphCompare.isomorphism(d, GraphCompare.complement(d));
+        if (r.map != null) {
+            selfComplementary = true;
+            complementNote = "yes";
+        } else if (r.exhausted) {
+            complementNote = "undetermined (search limit reached)";
+        } else {
+            complementNote = "no";
         }
     }
 
+    // ==================================================================
+    // Centrality
+    // ==================================================================
+    private void computeCentralities() {
+        degreeCentrality = new double[n];
+        closeness = new double[n];
+        for (int v = 0; v < n; v++) {
+            degreeCentrality[v] = n > 1 ? (double) d.nbr[v].length / (n - 1) : 0;
+            double[] dist = d.distFrom(v);
+            int reach = 0;
+            double sum = 0;
+            for (int w = 0; w < n; w++) {
+                if (w != v && dist[w] < GraphData.INF) {
+                    reach++;
+                    sum += dist[w];
+                }
+            }
+            closeness[v] = (reach > 0 && n > 1 && sum > 0) ? ((double) reach / sum) * ((double) reach / (n - 1)) : 0;
+        }
+        betweenness = brandes();
+    }
+
+    private double[] brandes() {
+        double[] cb = new double[n];
+        for (int s = 0; s < n; s++) {
+            double[] dist = new double[n];
+            Arrays.fill(dist, GraphData.INF);
+            double[] sigma = new double[n];
+            boolean[] done = new boolean[n];
+            Vector<Vector<Integer>> pred = new Vector<Vector<Integer>>();
+            for (int i = 0; i < n; i++) {
+                pred.add(new Vector<Integer>());
+            }
+            Vector<Integer> stack = new Vector<Integer>();
+            dist[s] = 0;
+            sigma[s] = 1;
+            for (int it = 0; it < n; it++) {
+                int u = -1;
+                for (int i = 0; i < n; i++) {
+                    if (!done[i] && dist[i] < GraphData.INF && (u == -1 || dist[i] < dist[u])) {
+                        u = i;
+                    }
+                }
+                if (u == -1) {
+                    break;
+                }
+                done[u] = true;
+                stack.add(u);
+                for (int v : d.out[u]) {
+                    double nd = dist[u] + d.arcLength(u, v);
+                    if (nd < dist[v] - EPS) {
+                        dist[v] = nd;
+                        sigma[v] = sigma[u];
+                        pred.get(v).clear();
+                        pred.get(v).add(u);
+                    } else if (Math.abs(nd - dist[v]) <= EPS && !done[v]) {
+                        sigma[v] += sigma[u];
+                        pred.get(v).add(u);
+                    }
+                }
+            }
+            double[] delta = new double[n];
+            for (int k = stack.size() - 1; k >= 0; k--) {
+                int w = stack.get(k);
+                for (int v : pred.get(w)) {
+                    delta[v] += sigma[v] / sigma[w] * (1 + delta[w]);
+                }
+                if (w != s) {
+                    cb[w] += delta[w];
+                }
+            }
+        }
+        double norm = 1;
+        if (n > 2) {
+            norm = d.directed ? (double) (n - 1) * (n - 2) : (double) (n - 1) * (n - 2) / 2.0;
+        }
+        for (int v = 0; v < n; v++) {
+            if (n <= 2) {
+                cb[v] = 0;
+            } else {
+                cb[v] = (d.directed ? cb[v] : cb[v] / 2.0) / norm;
+            }
+        }
+        return cb;
+    }
+
+    // ==================================================================
+    // Node table (Vertices tab)
+    // ==================================================================
+    private void buildNodeTable() {
+        Vector<String> cols = new Vector<String>();
+        Vector<Class<?>> classes = new Vector<Class<?>>();
+        cols.add("Vertex");
+        classes.add(String.class);
+        cols.add("Degree");
+        classes.add(Integer.class);
+        if (d.directed) {
+            cols.add("In");
+            classes.add(Integer.class);
+            cols.add("Out");
+            classes.add(Integer.class);
+        }
+        cols.add("Isolated");
+        classes.add(String.class);
+        cols.add("Loop");
+        classes.add(String.class);
+        cols.add("Cutpoint");
+        classes.add(String.class);
+        cols.add("Degree C.");
+        classes.add(Double.class);
+        cols.add("Closeness");
+        classes.add(Double.class);
+        cols.add("Betweenness");
+        classes.add(Double.class);
+
+        nodeColumns = cols.toArray(new String[0]);
+        nodeClasses = classes.toArray(new Class<?>[0]);
+        nodeRows = new Object[n][];
+        for (int v = 0; v < n; v++) {
+            ArrayList<Object> row = new ArrayList<Object>();
+            row.add(d.names[v]);
+            row.add(d.degree[v]);
+            if (d.directed) {
+                row.add(d.indeg[v]);
+                row.add(d.outdeg[v]);
+            }
+            row.add(d.degree[v] == 0 ? "yes" : "no");
+            row.add(d.loops[v] > 0 ? "yes" : "no");
+            row.add(isCut[v] ? "yes" : "no");
+            row.add(round2(degreeCentrality[v]));
+            row.add(round2(closeness[v]));
+            row.add(round2(betweenness[v]));
+            nodeRows[v] = row.toArray();
+        }
+    }
+
+    private static double round2(double x) {
+        return Math.round(x * 100.0) / 100.0;
+    }
+
+    // ==================================================================
+    // Overview rows
+    // ==================================================================
     private String yn(boolean b) {
         return b ? "yes" : "no";
     }
 
-    private String namesOf(Vector<Vertex> vs) {
+    private int st(boolean b) {
+        return b ? YES : NO;
+    }
+
+    private String names(Vector<Integer> vs) {
         if (vs.isEmpty()) {
             return "none";
         }
@@ -507,78 +970,236 @@ public class GraphAnalyzer {
             if (i > 0) {
                 sb.append(", ");
             }
-            sb.append(vs.get(i).name);
+            sb.append(d.names[vs.get(i)]);
         }
         return sb.toString();
     }
 
-    private String edgeNamesOf(Vector<Edge> es) {
-        if (es.isEmpty()) {
-            return "none";
-        }
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < es.size(); i++) {
+    private String edgeName(int e) {
+        return "(" + d.names[d.eu[e]] + (d.directed ? "\u2192" : "\u2013") + d.names[d.ev[e]] + ")";
+    }
+
+    private String setString(int[] vs) {
+        StringBuilder sb = new StringBuilder("{");
+        for (int i = 0; i < vs.length; i++) {
             if (i > 0) {
-                sb.append(", ");
+                sb.append(",");
             }
-            sb.append("(").append(es.get(i).vertex1.name).append("-").append(es.get(i).vertex2.name).append(")");
+            sb.append(d.names[vs[i]]);
+        }
+        return sb.append("}").toString();
+    }
+
+    private void buildOverview() {
+        Vector<Row> r = overview;
+
+        // ---------------- Basics ----------------
+        r.add(Row.section("Basics", Ui.GROUP_BASIC, "Size and shape of the graph"));
+        r.add(Row.prop("Type", (d.directed ? "Directed" : "Undirected") + ", " + (d.weighted ? "weighted" : "unweighted"), NONE,
+                "Directed: edges are arcs with a tail and a head. Weighted: each edge carries a positive weight used as its length."));
+        r.add(Row.prop("Order |V|", String.valueOf(order), NONE, "Number of vertices."));
+        r.add(Row.prop("Size |E|", String.valueOf(size), NONE, "Number of edges (loops and parallel edges each count)."));
+        String simpleWhy = "";
+        if (!simple) {
+            Vector<String> why = new Vector<String>();
+            if (d.totalLoops > 0) {
+                why.add("loops");
+            }
+            if (multigraph) {
+                why.add("parallel edges");
+            }
+            simpleWhy = " \u2014 has " + join(why, " and ");
+        }
+        r.add(Row.prop("Simple graph", yn(simple) + simpleWhy, st(simple),
+                "A simple graph has no self-loops and no two edges joining the same ordered (directed) / unordered (undirected) pair."));
+        r.add(Row.prop("Multigraph", multigraph ? "yes \u2014 " + parallelPairs() + " pair(s) with parallel edges"
+                + (d.totalLoops > 0 ? ", plus loops (pseudograph)" : "")
+                : (d.totalLoops > 0 ? "no parallel edges, but has loops (pseudograph)" : "no"), st(multigraph),
+                "A multigraph allows several edges between the same two vertices. If loops are allowed too it is called a pseudograph."));
+        if (d.weighted && d.m > 0) {
+            double sum = 0, mn = GraphData.INF, mx = 0;
+            for (double w : d.ew) {
+                sum += w;
+                mn = Math.min(mn, w);
+                mx = Math.max(mx, w);
+            }
+            r.add(Row.prop("Weights", "total " + Ui.fmt(sum) + ", min " + Ui.fmt(mn) + ", max " + Ui.fmt(mx), NONE,
+                    "Weights are positive. Shortest paths (geodesics) use the lightest edge between each pair."));
+        }
+        String dens;
+        if (n < 2) {
+            dens = "n/a";
+        } else {
+            String label = density <= 0.3 ? "Sparse" : density >= 0.7 ? "Dense" : "Moderate";
+            dens = label + " (" + Math.round(density * 100) + "% of possible edges)";
+        }
+        r.add(Row.prop("Sparse / Dense", dens, NONE,
+                "Density = distinct adjacent pairs / possible pairs. Sparse is 30% or less, dense is 70% or more."));
+
+        // ---------------- Connectivity ----------------
+        r.add(Row.section("Connectivity", Ui.GROUP_CONNECT, "How well the graph holds together"));
+        if (d.directed) {
+            r.add(Row.prop("Connected (weakly)", yn(connected), st(connected),
+                    "Weakly connected: the graph is connected when edge directions are ignored."));
+            r.add(Row.prop("Strongly connected", yn(stronglyConnected), st(stronglyConnected),
+                    "Strongly connected: every vertex can reach every other vertex along directed edges."));
+            r.add(Row.prop("Components", "weak " + components + ", strong " + strongComponents, NONE,
+                    "Number of weakly and strongly connected components."));
+        } else {
+            r.add(Row.prop("Connected", yn(connected), st(connected), "There is a path between every pair of vertices."));
+            StringBuilder cs = new StringBuilder();
+            for (Vector<Integer> comp : compList) {
+                if (cs.length() > 0) {
+                    cs.append(" ");
+                }
+                int[] a = new int[comp.size()];
+                for (int i = 0; i < a.length; i++) {
+                    a[i] = comp.get(i);
+                }
+                cs.append(setString(a));
+            }
+            r.add(Row.prop("Components", components + " \u2014 " + cs, NONE,
+                    "Maximal connected pieces of the graph: " + cs));
+        }
+        r.add(Row.prop("Vertex connectivity \u03BA", vertexConnectivity < 0 ? "not computed (more than " + CONNECTIVITY_LIMIT + " vertices)"
+                : String.valueOf(vertexConnectivity), NONE,
+                "Minimum number of vertices whose removal disconnects the graph (or leaves a single vertex). Computed with max-flow / Menger's theorem."));
+        r.add(Row.prop("Edge connectivity \u03BB", edgeConnectivity < 0 ? "not computed (more than " + CONNECTIVITY_LIMIT + " vertices)"
+                : String.valueOf(edgeConnectivity), NONE,
+                "Minimum number of edges whose removal disconnects the graph."));
+        StringBuilder bs = new StringBuilder();
+        for (int i = 0; i < bridges.size(); i++) {
+            if (i > 0) {
+                bs.append(", ");
+            }
+            bs.append(edgeName(bridges.get(i)));
+        }
+        r.add(Row.prop("Bridges", bridges.isEmpty() ? "none" : bridges.size() + " \u2014 " + bs, bridges.isEmpty() ? NO : WARN,
+                "A bridge is an edge whose removal increases the number of components (judged on the underlying undirected graph)."
+                + (bridges.isEmpty() ? "" : " Bridges: " + bs)));
+        r.add(Row.prop("Cutpoints", cutVertices.isEmpty() ? "none" : cutVertices.size() + " \u2014 " + names(cutVertices),
+                cutVertices.isEmpty() ? NO : WARN,
+                "A cutpoint (articulation vertex) is a vertex whose removal increases the number of components. Highlighted orange on the canvas."));
+        StringBuilder bl = new StringBuilder();
+        for (int i = 0; i < blocks.size(); i++) {
+            if (i > 0) {
+                bl.append(" ");
+            }
+            bl.append(setString(blocks.get(i)));
+        }
+        r.add(Row.prop("Blocks", blocks.isEmpty() ? "none" : blocks.size() + " \u2014 " + bl, NONE,
+                "A block is a maximal nonseparable subgraph (a maximal piece with no cutpoint). Blocks: " + bl));
+        r.add(Row.prop("Nonseparable", yn(nonseparable), st(nonseparable),
+                "A nonseparable graph is connected, has at least 2 vertices and no cutpoints (it is a single block)."));
+
+        // ---------------- Families ----------------
+        r.add(Row.section("Graph families", Ui.GROUP_FAMILY, "Special named graph classes"));
+        r.add(Row.prop("Complete graph", complete ? "yes \u2014 K" + sub(n) : "no", st(complete),
+                "Every pair of distinct vertices is adjacent" + (d.directed ? " in both directions." : ".")));
+        r.add(Row.prop("Empty graph", empty ? "yes \u2014 E" + sub(n) : "no", st(empty), "A graph with vertices but no edges."));
+        r.add(Row.prop("Cycle graph", cycleGraph ? "yes \u2014 C" + sub(n) : "no", st(cycleGraph),
+                "A single cycle through all vertices (every vertex has degree 2 in an undirected graph; in-degree = out-degree = 1 in a digraph)."));
+        String bip;
+        if (bipartite) {
+            Vector<Integer> a = new Vector<Integer>(), b = new Vector<Integer>();
+            for (int v = 0; v < n; v++) {
+                (color2[v] == 0 ? a : b).add(v);
+            }
+            bip = "yes \u2014 {" + names(a) + "} | {" + names(b) + "}";
+        } else {
+            bip = d.totalLoops > 0 ? "no \u2014 a loop is an odd cycle" : "no \u2014 contains an odd cycle";
+        }
+        r.add(Row.prop("Bipartite", bip, st(bipartite), "The vertices split into two sets with every edge going between the sets (no odd cycle)."));
+        String kpq = "";
+        if (completeBipartite) {
+            int p = 0;
+            for (int v = 0; v < n; v++) {
+                if (color2[v] == 0) {
+                    p++;
+                }
+            }
+            kpq = " \u2014 K" + sub(p) + "," + sub(n - p);
+        }
+        r.add(Row.prop("Complete bipartite", yn(completeBipartite) + kpq, st(completeBipartite),
+                "Bipartite, and every vertex of one side is adjacent to every vertex of the other."));
+        r.add(Row.prop("Star", star ? "yes \u2014 K" + sub(1) + "," + sub(n - 1) + " (centre " + d.names[centre] + ")" : "no", st(star),
+                "One centre vertex joined to every other vertex, with no other edges."));
+        r.add(Row.prop("Tree", yn(tree), st(tree), "Connected and acyclic (judged on the underlying undirected graph)."));
+        r.add(Row.prop("Forest", forest ? "yes \u2014 " + components + " tree(s)" : "no", st(forest),
+                "Acyclic: every component is a tree."));
+        r.add(Row.prop("Cyclic / Acyclic", cyclic ? "Cyclic" : "Acyclic", cyclic ? WARN : YES,
+                d.directed ? "Directed graphs: cyclic means a directed cycle exists (acyclic = DAG)."
+                : "Cyclic means the graph contains a cycle (parallel edges and loops count as cycles)."));
+
+        // ---------------- Traversability ----------------
+        r.add(Row.section("Traversability", Ui.GROUP_TRAVERSE, "Walks that visit every edge or every vertex"));
+        String eul;
+        int eulState;
+        if (eulerian) {
+            eul = "yes \u2014 Euler circuit (" + eulerNote + ")";
+            eulState = YES;
+        } else if (semiEulerian) {
+            eul = "semi \u2014 " + eulerNote;
+            eulState = WARN;
+        } else {
+            eul = "no \u2014 " + eulerNote;
+            eulState = NO;
+        }
+        r.add(Row.prop("Eulerian", eul, eulState,
+                "Eulerian: a closed trail that uses every edge exactly once. Semi-Eulerian: an open trail does, but no circuit exists."));
+        String ham;
+        int hamState;
+        if (!hamiltonianChecked) {
+            ham = n < 3 ? "n/a (needs at least 3 vertices)" : "not checked (more than " + HAMILTONIAN_LIMIT + " vertices)";
+            hamState = NONE;
+        } else {
+            ham = yn(hamiltonian);
+            hamState = st(hamiltonian);
+        }
+        r.add(Row.prop("Hamiltonian", ham, hamState, "A cycle that visits every vertex exactly once."));
+        r.add(Row.prop("Traceable", n > HAMILTONIAN_LIMIT ? "not checked" : yn(traceable), n > HAMILTONIAN_LIMIT ? NONE : st(traceable),
+                "A path (not necessarily closed) that visits every vertex exactly once."));
+        String mnh;
+        int mnhState;
+        if (!maxNonHamChecked) {
+            mnh = n < 3 ? "n/a" : "not checked (more than " + MAX_NON_HAM_LIMIT + " vertices)";
+            mnhState = NONE;
+        } else if (hamiltonian) {
+            mnh = "no \u2014 the graph is Hamiltonian";
+            mnhState = NO;
+        } else {
+            mnh = yn(maximalNonHamiltonian);
+            mnhState = st(maximalNonHamiltonian);
+        }
+        r.add(Row.prop("Maximal non-Hamiltonian", mnh, mnhState,
+                "Not Hamiltonian, but adding any missing edge makes it Hamiltonian."));
+
+        // ---------------- Transformations ----------------
+        r.add(Row.section("Transformations", Ui.GROUP_OTHER, "Operations and related graphs"));
+        r.add(Row.prop("Complement", "complement has " + complementEdges + " edge(s)  (Graph \u2192 Replace with Complement)", NONE,
+                "The complement joins exactly the pairs that are NOT adjacent in G."));
+        r.add(Row.prop("Self-complementary", complementNote, selfComplementary ? YES : NONE,
+                "G is isomorphic to its own complement."));
+    }
+
+    private static String join(Vector<String> v, String sep) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < v.size(); i++) {
+            if (i > 0) {
+                sb.append(sep);
+            }
+            sb.append(v.get(i));
         }
         return sb.toString();
     }
 
-    private void printReport() {
-        System.out.println("================ GRAPH / NODE PROPERTIES ================");
-        for (String s : graphSummary) {
-            System.out.println(s);
+    private static String sub(int k) {
+        String digits = "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089";
+        String s = String.valueOf(k);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            sb.append(digits.charAt(s.charAt(i) - '0'));
         }
-        System.out.println();
-        for (String s : nodeSummary) {
-            System.out.println(s);
-        }
-        System.out.println("===========================================================");
-    }
-
-    // ---------------- Drawing ----------------
-
-    public void drawGraphSummary(Graphics g, int x, int y, int maxY) {
-        Font orig = g.getFont();
-        g.setColor(Color.black);
-        int lineH = 16;
-
-        g.setFont(new Font("Monospaced", Font.BOLD, 14));
-        g.drawString("Graph Properties", x, y);
-        y += lineH + 6;
-
-        g.setFont(new Font("Monospaced", Font.PLAIN, 12));
-        for (String s : graphSummary) {
-            if (y > maxY) {
-                g.drawString("... see console", x, y);
-                break;
-            }
-            g.drawString(s, x, y);
-            y += lineH;
-        }
-        g.setFont(orig);
-    }
-
-    public void drawNodeSummary(Graphics g, int x, int y, int maxY) {
-        Font orig = g.getFont();
-        g.setColor(Color.black);
-        int lineH = 16;
-
-        g.setFont(new Font("Monospaced", Font.BOLD, 14));
-        g.drawString("Node Properties", x, y);
-        y += lineH + 6;
-
-        g.setFont(new Font("Monospaced", Font.PLAIN, 12));
-        for (String s : nodeSummary) {
-            if (y > maxY) {
-                g.drawString("... see console", x, y);
-                break;
-            }
-            g.drawString(s, x, y);
-            y += lineH;
-        }
-        g.setFont(orig);
+        return sb.toString();
     }
 }

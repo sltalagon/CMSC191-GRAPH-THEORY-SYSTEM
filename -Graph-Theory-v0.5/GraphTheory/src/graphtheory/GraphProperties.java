@@ -1,147 +1,208 @@
 /*
- * To change this template, choose Tools | Templates
- * and open the template in the editor.
+ * Matrices (adjacency / weight / distance) and the vertex-disjoint "container"
+ * analysis used for the k-wide diameters D_k(G).
  */
 package graphtheory;
 
-import java.awt.Color;
-import java.awt.Font;
-import java.awt.Graphics;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Vector;
 
 /**
- *
  * @author mk
  */
 public class GraphProperties {
 
-    public int[][] adjacencyMatrix;
-    public int[][] distanceMatrix;
-    public Vector<VertexPair> vpList;
+    /** Containers are exponential in the number of vertices, so they are limited. */
+    public static final int CONTAINER_LIMIT = 8;
+    public static final int AUTO_CONTAINER_LIMIT = 6;
+    private static final int PATH_CAP = 1500;
+    private static final int DETAIL_CONTAINERS_PER_PAIR = 5;
 
-    // Summary text produced by displayContainers(), reused by drawSummary()
-    public Vector<String> summaryLines = new Vector<String>();
-    public String diameterLine = "";
-
-    public int[][] generateAdjacencyMatrix(Vector<Vertex> vList, Vector<Edge> eList) {
-        adjacencyMatrix = new int[vList.size()][vList.size()];
-
-        for (int a = 0; a < vList.size(); a++)//initialize
-        {
-            for (int b = 0; b < vList.size(); b++) {
-                adjacencyMatrix[a][b] = 0;
-            }
+    // ------------------------------------------------------------------
+    // Matrices
+    // ------------------------------------------------------------------
+    /** Number of edges between each pair (diagonal = number of loops). */
+    public static int[][] adjacencyMatrix(GraphData d) {
+        int[][] a = new int[d.n][];
+        for (int i = 0; i < d.n; i++) {
+            a[i] = d.mult[i].clone();
         }
-
-        for (int i = 0; i < eList.size(); i++) {
-            adjacencyMatrix[vList.indexOf(eList.get(i).vertex1)][vList.indexOf(eList.get(i).vertex2)] = 1;
-            adjacencyMatrix[vList.indexOf(eList.get(i).vertex2)][vList.indexOf(eList.get(i).vertex1)] = 1;
-        }
-        return adjacencyMatrix;
+        return a;
     }
 
-    public int[][] generateDistanceMatrix(Vector<Vertex> vList) {
-        distanceMatrix = new int[vList.size()][vList.size()];
-
-        for (int a = 0; a < vList.size(); a++)//initialize
-        {
-            for (int b = 0; b < vList.size(); b++) {
-                distanceMatrix[a][b] = 0;
-            }
+    /** Lightest edge weight between each pair (infinity where there is no edge). */
+    public static double[][] weightMatrix(GraphData d) {
+        double[][] w = new double[d.n][];
+        for (int i = 0; i < d.n; i++) {
+            w[i] = d.minW[i].clone();
         }
-
-        VertexPair vp;
-        int shortestDistance;
-        for (int i = 0; i < vList.size(); i++) {
-            for (int j = i + 1; j < vList.size(); j++) {
-                vp = new VertexPair(vList.get(i), vList.get(j));
-                shortestDistance = vp.getShortestDistance();
-                distanceMatrix[vList.indexOf(vp.vertex1)][vList.indexOf(vp.vertex2)] = shortestDistance;
-                distanceMatrix[vList.indexOf(vp.vertex2)][vList.indexOf(vp.vertex1)] = shortestDistance;
-            }
-        }
-        return distanceMatrix;
+        return w;
     }
 
-    private String pathToString(Vector<Vertex> path) {
-        StringBuilder sb = new StringBuilder();
-        for (int k = 0; k < path.size(); k++) {
-            if (k > 0) {
-                sb.append(" -> ");
-            }
-            sb.append(path.get(k).name);
+    /** Shortest distance between each pair in the active metric (edges, or weights if weighted). */
+    public static double[][] distanceMatrix(GraphData d) {
+        double[][] m = new double[d.n][];
+        for (int i = 0; i < d.n; i++) {
+            m[i] = d.distFrom(i);
         }
-        return sb.toString();
+        return m;
     }
 
-    @SuppressWarnings("unchecked")
-    public void displayContainers(Vector<Vertex> vList) {
-        vpList = new Vector<VertexPair>();
-        int[] D = new int[vList.size() + 1];          // D[k] = D_k(G)
-        Arrays.fill(D, -1);
+    // ------------------------------------------------------------------
+    // Containers / wide diameters
+    // ------------------------------------------------------------------
+    public static class ContainerResult {
+
+        public String[] columns = new String[0];
+        public Object[][] rows = new Object[0][0];
+        public String diameterLine = "";
+        public String detail = "";
+        public boolean truncated;       // some pair had more paths than the cap
+        public int maxWidth;
+    }
+
+    /**
+     * For every pair, builds containers (sets of internally vertex-disjoint paths) and
+     * derives d_k(u,v), then D_k(G) = max over pairs. Paths follow arc direction.
+     * Containers are built greedily from each path, as in the original project.
+     */
+    public static ContainerResult computeContainers(GraphData d) {
+        ContainerResult res = new ContainerResult();
+        int n = d.n;
         Vector<String> pairNames = new Vector<String>();
         Vector<int[]> rows = new Vector<int[]>();
+        int[] D = new int[n + 2];
+        Arrays.fill(D, -1);
+        StringBuilder detail = new StringBuilder();
 
-        System.out.println("================ VERTEX-PAIR / CONTAINER PROPERTIES ================");
-        System.out.println("Vertices: " + vList.size() + "   (path length = number of edges)");
+        for (int a = 0; a < n; a++) {
+            for (int b = d.directed ? 0 : a + 1; b < n; b++) {
+                if (a == b) {
+                    continue;
+                }
+                String pairName = "(" + d.names[a] + (d.directed ? "\u2192" : ",") + d.names[b] + ")";
+                Vector<int[]> paths = new Vector<int[]>();
+                boolean[] on = new boolean[n];
+                int[] seq = new int[n];
+                seq[0] = a;
+                on[a] = true;
+                boolean[] trunc = {false};
+                enumerate(d, a, b, seq, 1, on, paths, trunc);
+                if (trunc[0]) {
+                    res.truncated = true;
+                }
 
-        for (int a = 0; a < vList.size(); a++) {
-            for (int b = a + 1; b < vList.size(); b++) {
-                VertexPair vp = new VertexPair(vList.get(a), vList.get(b));
-                vpList.add(vp);
-
-                String pairName = vp.vertex1.name + "," + vp.vertex2.name;
-                boolean adjacent = vp.vertex1.connectedToVertex(vp.vertex2);
-                int dist = vp.getShortestDistance();
-
-                System.out.println("\n---- Pair (" + pairName + ") ----");
-                System.out.println("  Adjacent: " + (adjacent ? "yes" : "no")
-                        + "   Reachable: " + (dist != -1 ? "yes (distance " + dist + ")" : "no"));
-
-                vp.generateVertexDisjointPaths();
-
-                int pairMaxWidth = 0;
-                for (int i = 0; i < vp.VertexDisjointContainer.size(); i++) {
-                    Vector<Vector<Vertex>> container = (Vector<Vector<Vertex>>) vp.VertexDisjointContainer.get(i);
-                    if (container.isEmpty()) {
-                        continue;
+                // internal-vertex sets for fast disjointness tests
+                BitSet[] inner = new BitSet[paths.size()];
+                for (int i = 0; i < paths.size(); i++) {
+                    inner[i] = new BitSet(n);
+                    int[] p = paths.get(i);
+                    for (int k = 1; k < p.length - 1; k++) {
+                        inner[i].set(p[k]);
                     }
-
-                    // longest path first
-                    Collections.sort(container, new descendingWidthComparator());
-                    int width = container.size();
-                    int longest = container.get(0).size() - 1;
-                    pairMaxWidth = Math.max(pairMaxWidth, width);
-
-                    System.out.println("  Container " + (i + 1) + "  (width " + width
-                            + ", longest path " + longest + ")");
-                    for (int j = 0; j < width; j++) {
-                        Vector<Vertex> p = container.get(j);
-                        System.out.printf("    P%d: %-20s (length %d)%n",
-                                j + 1, pathToString(p), p.size() - 1);
+                }
+                Vector<BitSet> containers = new Vector<BitSet>();
+                for (int i = 0; i < paths.size(); i++) {
+                    BitSet members = new BitSet(paths.size());
+                    members.set(i);
+                    BitSet used = (BitSet) inner[i].clone();
+                    for (int j = 0; j < paths.size(); j++) {
+                        if (j != i && !used.intersects(inner[j])) {
+                            members.set(j);
+                            used.or(inner[j]);
+                        }
+                    }
+                    boolean contained = false;
+                    for (BitSet c : containers) {
+                        BitSet x = (BitSet) members.clone();
+                        x.andNot(c);
+                        if (x.isEmpty()) {
+                            contained = true;
+                            break;
+                        }
+                    }
+                    if (!contained) {
+                        containers.add(members);
                     }
                 }
 
-                // d_k(pair) = min over containers with >= k paths of the k-th shortest path length
+                // path lengths per container, longest first
+                Vector<int[]> lens = new Vector<int[]>();
+                Vector<BitSet> kept = new Vector<BitSet>();
+                int pairMaxWidth = 0;
+                for (BitSet c : containers) {
+                    int[] l = new int[c.cardinality()];
+                    int k = 0;
+                    for (int i = c.nextSetBit(0); i >= 0; i = c.nextSetBit(i + 1)) {
+                        l[k++] = paths.get(i).length - 1;
+                    }
+                    Arrays.sort(l);                     // ascending: l[k-1] = k-th shortest
+                    lens.add(l);
+                    kept.add(c);
+                    pairMaxWidth = Math.max(pairMaxWidth, l.length);
+                }
+
                 int[] row = new int[D.length];
                 Arrays.fill(row, -1);
                 for (int k = 1; k <= pairMaxWidth; k++) {
                     int best = Integer.MAX_VALUE;
-                    for (int i = 0; i < vp.VertexDisjointContainer.size(); i++) {
-                        Vector<Vector<Vertex>> container = (Vector<Vector<Vertex>>) vp.VertexDisjointContainer.get(i);
-                        if (container.size() >= k) {
-                            // sorted longest-first, so the k-th shortest is at size - k
-                            best = Math.min(best, container.get(container.size() - k).size() - 1);
+                    for (int[] l : lens) {
+                        if (l.length >= k) {
+                            best = Math.min(best, l[k - 1]);
                         }
                     }
                     row[k] = best;
                     D[k] = Math.max(D[k], best);
                 }
-                pairNames.add("(" + pairName + ")");
+                pairNames.add(pairName);
                 rows.add(row);
+                res.maxWidth = Math.max(res.maxWidth, pairMaxWidth);
+
+                // text detail (a handful of widest containers per pair)
+                detail.append(pairName).append("  \u2014  ").append(paths.size()).append(" path(s)")
+                        .append(trunc[0] ? "+" : "").append(", widest container ").append(pairMaxWidth).append("\n");
+                Integer[] orderIdx = new Integer[containers.size()];
+                for (int i = 0; i < orderIdx.length; i++) {
+                    orderIdx[i] = i;
+                }
+                final Vector<int[]> flens = lens;
+                Arrays.sort(orderIdx, new Comparator<Integer>() {
+                    public int compare(Integer x, Integer y) {
+                        int c = flens.get(y).length - flens.get(x).length;
+                        if (c != 0) {
+                            return c;
+                        }
+                        return flens.get(x)[flens.get(x).length - 1] - flens.get(y)[flens.get(y).length - 1];
+                    }
+                });
+                int shown = Math.min(orderIdx.length, DETAIL_CONTAINERS_PER_PAIR);
+                for (int q = 0; q < shown; q++) {
+                    BitSet c = containers.get(orderIdx[q]);
+                    int[] l = lens.get(orderIdx[q]);
+                    detail.append("  Container ").append(q + 1).append("  (width ").append(l.length)
+                            .append(", longest path ").append(l[l.length - 1]).append(")\n");
+                    int pi = 1;
+                    Vector<int[]> members = new Vector<int[]>();
+                    for (int i = c.nextSetBit(0); i >= 0; i = c.nextSetBit(i + 1)) {
+                        members.add(paths.get(i));
+                    }
+                    Collections.sort(members, new Comparator<int[]>() {
+                        public int compare(int[] x, int[] y) {
+                            return y.length - x.length;
+                        }
+                    });
+                    for (int[] p : members) {
+                        detail.append("    P").append(pi++).append(": ").append(d.pathString(p, p.length))
+                                .append("  (length ").append(p.length - 1).append(")\n");
+                    }
+                }
+                if (orderIdx.length > shown) {
+                    detail.append("  \u2026 ").append(orderIdx.length - shown).append(" more container(s)\n");
+                }
+                detail.append("\n");
             }
         }
 
@@ -151,197 +212,48 @@ public class GraphProperties {
                 maxK = k;
             }
         }
-
-        // Build summary text (shared by console and the Properties window)
-        summaryLines.clear();
-        StringBuilder header = new StringBuilder(String.format("%-9s", "Pair"));
+        res.columns = new String[maxK + 1];
+        res.columns[0] = "Pair";
         for (int k = 1; k <= maxK; k++) {
-            header.append(String.format("%-8s", k + "-wide"));
+            res.columns[k] = k + "-wide";
         }
-        summaryLines.add(header.toString());
-
+        res.rows = new Object[rows.size()][];
         for (int r = 0; r < rows.size(); r++) {
-            StringBuilder line = new StringBuilder(String.format("%-9s", pairNames.get(r)));
+            Object[] line = new Object[maxK + 1];
+            line[0] = pairNames.get(r);
             for (int k = 1; k <= maxK; k++) {
-                line.append(String.format("%-8s", rows.get(r)[k] == -1 ? "-" : String.valueOf(rows.get(r)[k])));
+                line[k] = rows.get(r)[k] == -1 ? "-" : String.valueOf(rows.get(r)[k]);
             }
-            summaryLines.add(line.toString());
+            res.rows[r] = line;
         }
-
-        StringBuilder d = new StringBuilder();
+        StringBuilder dl = new StringBuilder();
         for (int k = 1; k <= maxK; k++) {
-            d.append("D").append(k).append("(G)=").append(D[k]).append("   ");
+            dl.append("D").append(k).append("(G) = ").append(D[k]).append("     ");
         }
-        diameterLine = d.toString().trim();
-
-        System.out.println("\n---- Summary ----");
-        for (String s : summaryLines) {
-            System.out.println(s);
-        }
-        System.out.println();
-        System.out.println(diameterLine);
-        System.out.println("======================================================================");
+        res.diameterLine = dl.toString().trim();
+        res.detail = detail.toString();
+        return res;
     }
 
-    public void drawSummary(Graphics g, int x, int y, int maxY) {
-        Font orig = g.getFont();
-        int lineH = 16;
-        g.setColor(Color.black);
-
-        g.setFont(new Font("Monospaced", Font.BOLD, 13));
-        g.drawString("Diameters (length = number of edges)", x, y);
-        y += lineH;
-        g.drawString(diameterLine, x, y);
-        y += lineH + 8;
-
-        g.setFont(new Font("Monospaced", Font.PLAIN, 12));
-        for (int i = 0; i < summaryLines.size(); i++) {
-            if (y > maxY) {
-                g.drawString("... see console for the rest", x, y);
-                break;
-            }
-            g.drawString(summaryLines.get(i), x, y);
-            y += lineH;
+    private static void enumerate(GraphData d, int u, int target, int[] seq, int len, boolean[] on,
+            Vector<int[]> paths, boolean[] trunc) {
+        if (paths.size() >= PATH_CAP) {
+            trunc[0] = true;
+            return;
         }
-        g.setFont(orig);
-    }
-
-    public void drawAdjacencyMatrix(Graphics g, Vector<Vertex> vList, int x, int y) {
-        int cSize = 20;
-        g.setColor(Color.LIGHT_GRAY);
-        g.fillRect(x, y-30, vList.size() * cSize+cSize, vList.size() * cSize+cSize);
-        g.setColor(Color.black);
-        g.drawString("AdjacencyMatrix", x, y - cSize);
-        for (int i = 0; i < vList.size(); i++) {
-            g.setColor(Color.RED);
-            g.drawString(vList.get(i).name, x + cSize + i * cSize, y);
-            g.drawString(vList.get(i).name, x, cSize + i * cSize + y);
-            g.setColor(Color.black);
-            for (int j = 0; j < vList.size(); j++) {
-                g.drawString("" + adjacencyMatrix[i][j], x + cSize * (j + 1), y + cSize * (i + 1));
-            }
+        if (u == target) {
+            paths.add(Arrays.copyOf(seq, len));
+            return;
         }
-    }
-
-    public void drawDistanceMatrix(Graphics g, Vector<Vertex> vList, int x, int y) {
-        int cSize = 20;
-        g.setColor(Color.LIGHT_GRAY);
-        g.fillRect(x, y-30, vList.size() * cSize+cSize, vList.size() * cSize+cSize);
-        g.setColor(Color.black);
-        g.drawString("ShortestPathMatrix", x, y - cSize);
-        for (int i = 0; i < vList.size(); i++) {
-            g.setColor(Color.RED);
-            g.drawString(vList.get(i).name, x + cSize + i * cSize, y);
-            g.drawString(vList.get(i).name, x, cSize + i * cSize + y);
-            g.setColor(Color.black);
-            for (int j = 0; j < vList.size(); j++) {
-                g.drawString("" + distanceMatrix[i][j], x + cSize * (j + 1), y + cSize * (i + 1));
-            }
-        }
-    }
-
-    public Vector<Vertex> vertexConnectivity(Vector<Vertex> vList) {
-        Vector<Vertex> origList = new Vector<Vertex>();
-        Vector<Vertex> tempList = new Vector<Vertex>();
-        Vector<Vertex> toBeRemoved = new Vector<Vertex>();
-        Vertex victim;
-
-
-        origList.setSize(vList.size());
-        Collections.copy(origList, vList);
-
-        int maxPossibleRemove = 0;
-        while (graphConnectivity(origList)) {
-            Collections.sort(origList, new ascendingDegreeComparator());
-            maxPossibleRemove = origList.firstElement().getDegree();
-
-            for (Vertex v : origList) {
-                if (v.getDegree() == maxPossibleRemove) {
-                    for (Vertex z : v.connectedVertices) {
-                        if (!tempList.contains(z)) {
-                            tempList.add(z);
-                        }
-                    }
+        for (int v : d.out[u]) {
+            if (!on[v]) {
+                on[v] = true;
+                seq[len] = v;
+                enumerate(d, v, target, seq, len + 1, on, paths, trunc);
+                on[v] = false;
+                if (trunc[0]) {
+                    return;
                 }
-            }
-
-            while (graphConnectivity(origList) && tempList.size() > 0) {
-                Collections.sort(tempList, new descendingDegreeComparator());
-                victim = tempList.firstElement();
-                tempList.removeElementAt(0);
-                origList.remove(victim);
-                for (Vertex x : origList) {
-                    x.connectedVertices.remove(victim);
-                }
-                toBeRemoved.add(victim);
-            }
-            tempList.removeAllElements();
-        }
-
-        return toBeRemoved;
-    }
-
-    private boolean graphConnectivity(Vector<Vertex> vList) {
-
-        Vector<Vertex> visitedList = new Vector<Vertex>();
-
-        recurseGraphConnectivity(vList.firstElement().connectedVertices, visitedList); //recursive function
-        if (visitedList.size() != vList.size()) {
-            return false;
-        } else {
-            return true;
-        }
-    }
-
-    private void recurseGraphConnectivity(Vector<Vertex> vList, Vector<Vertex> visitedList) {
-        for (Vertex v : vList) {
-            {
-                if (!visitedList.contains(v)) {
-                    visitedList.add(v);
-                    recurseGraphConnectivity(v.connectedVertices, visitedList);
-                }
-            }
-        }
-    }
-
-    private class ascendingDegreeComparator implements Comparator {
-
-        public int compare(Object v1, Object v2) {
-
-            if (((Vertex) v1).getDegree() > ((Vertex) v2).getDegree()) {
-                return 1;
-            } else if (((Vertex) v1).getDegree() < ((Vertex) v2).getDegree()) {
-                return -1;
-            } else {
-                return 0;
-            }
-        }
-    }
-
-    private class descendingDegreeComparator implements Comparator {
-
-        public int compare(Object v1, Object v2) {
-
-            if (((Vertex) v1).getDegree() > ((Vertex) v2).getDegree()) {
-                return -1;
-            } else if (((Vertex) v1).getDegree() < ((Vertex) v2).getDegree()) {
-                return 1;
-            } else {
-                return 0;
-            }
-        }
-    }
-
-    private class descendingWidthComparator implements Comparator {
-
-        public int compare(Object v1, Object v2) {
-
-            if (((Vector<Vertex>) v1).size() > (((Vector<Vertex>) v2).size())) {
-                return -1;
-            } else if (((Vector<Vertex>) v1).size() < (((Vector<Vertex>) v2).size())) {
-                return 1;
-            } else {
-                return 0;
             }
         }
     }

@@ -1,82 +1,79 @@
-/*
- * To change this template, choose Tools | Templates
- * and open the template in the editor.
- */
 package graphtheory;
 
 import java.awt.Color;
-import java.awt.Point;
-import java.util.Vector;
+import java.awt.Font;
+import java.awt.FontMetrics;
 import java.awt.Graphics;
+import java.awt.Graphics2D;
+import java.awt.Point;
 
 /**
+ * A vertex of the graph. Pure model + drawing: adjacency lives in {@link Graph}
+ * (edges) and {@link GraphData} (index based snapshot used by the analysers).
  *
  * @author mk
  */
-public class Vertex implements Comparable {
+public class Vertex {
+
+    public static final int RADIUS = 20;
 
     public String name;
     public Point location;
     public boolean wasFocused;
-    public boolean wasClicked;
-    private int size1 = 30;
-    private int size2 = 40;
-    public Vector<Vertex> connectedVertices;
+    public boolean wasClicked;      // selected / being dragged from
+    public boolean isCutVertex;     // cutpoint found by the analysis
+    public boolean danger;          // hovered by the Remove tool (about to be deleted)
+    public int role;                // 0 none, 1 = "From" of the Pair explorer, 2 = "To"
 
     public Vertex(String name, int x, int y) {
         this.name = name;
         location = new Point(x, y);
-        connectedVertices = new Vector<Vertex>();
-    }
-
-    public void addVertex(Vertex v) {
-        connectedVertices.add(v);
     }
 
     public boolean hasIntersection(int x, int y) {
-        double distance = Math.sqrt(Math.pow((x - location.x), 2) + Math.pow((y - location.y), 2));
-
-        if (distance > size2 / 2) {
-            return false;
-        } else {
-            return true;
-        }
-    }
-
-    public boolean connectedToVertex(Vertex v) {
-        if (connectedVertices.contains(v)) {
-            return true;
-        }
-        return false;
-    }
-
-    public int getDegree() {
-        return connectedVertices.size();
-    }
-
-    public int compareTo(Object v) {
-        if (((Vertex) v).getDegree() > getDegree()) {
-            return 1;
-        } else if (((Vertex) v).getDegree() < getDegree()) {
-            return -1;
-        } else {
-            return 0;
-        }
+        return location.distanceSq(x, y) <= (double) RADIUS * RADIUS;
     }
 
     public void draw(Graphics g) {
+        Graphics2D g2 = (Graphics2D) g;
+        int r = RADIUS;
+        int inner = 15;
+        Color ring = new Color(0x3B4252);
+        Color fill = Color.WHITE;
+        if (isCutVertex) {
+            ring = Ui.WARN;
+            fill = new Color(0xFFEFD9);
+        }
+        if (role == 1) {
+            ring = Ui.GOOD;
+        } else if (role == 2) {
+            ring = Ui.PURPLE;
+        }
+        if (wasFocused) {
+            ring = Ui.ACCENT_SOFT;
+        }
         if (wasClicked) {
-            g.setColor(Color.red);
-        } else if (wasFocused) {
-            g.setColor(Color.blue);
-        } else {
-            g.setColor(Color.black);
+            ring = Ui.ACCENT;
+            g2.setColor(new Color(0x2D, 0x6C, 0xDF, 60));      // selection halo
+            g2.fillOval(location.x - r - 6, location.y - r - 6, 2 * r + 12, 2 * r + 12);
+        }
+        if (danger) {
+            ring = Ui.DANGER;
         }
 
-        g.fillOval(location.x - size2 / 2, location.y - size2 / 2, size2, size2);
-        g.setColor(Color.WHITE);
-        g.fillOval(location.x - size1 / 2, location.y - size1 / 2, size1, size1);
-        g.setColor(Color.BLACK);
-        g.drawString(name, location.x, location.y);
+        g2.setColor(new Color(0, 0, 0, 26));                    // soft shadow
+        g2.fillOval(location.x - r + 1, location.y - r + 3, 2 * r, 2 * r);
+        g2.setColor(ring);
+        g2.fillOval(location.x - r, location.y - r, 2 * r, 2 * r);
+        g2.setColor(fill);
+        g2.fillOval(location.x - inner, location.y - inner, 2 * inner, 2 * inner);
+
+        Font orig = g2.getFont();
+        g2.setFont(orig.deriveFont(Font.BOLD, 13f));
+        FontMetrics fm = g2.getFontMetrics();
+        g2.setColor(Ui.INK);
+        g2.drawString(name, location.x - fm.stringWidth(name) / 2,
+                location.y + (fm.getAscent() - fm.getDescent()) / 2);
+        g2.setFont(orig);
     }
 }
